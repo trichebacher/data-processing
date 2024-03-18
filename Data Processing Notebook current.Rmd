@@ -1,0 +1,1409 @@
+---
+title: "R Notebook"
+author: "Tom Richebacher"
+output: html_notebook
+---
+
+```{r echo=FALSE}
+paste0("Date: ", Sys.Date())
+```
+
+# PROJECT SETUP {#sec-call-libaries}
+
+```{r, setup, call-libraries, warning=TRUE, include=FALSE}
+
+options(scipen = 999, show.gc.message = FALSE)
+use.integer64 <- FALSE
+
+
+#*****************ASSIGN PROJECT PATHES*****************************************
+#assign library path
+.libPaths("C:/Users/trich/OneDrive/R_code/rtest/R_testing/renv/library/R-4.3/x86_64-w64-mingw32")
+
+#define working directory of this notebook
+knitr::opts_knit$set(root.dir = "C:/Users/trich/OneDrive/R_code/house_prices")
+
+#set the project directory
+project_path <- knitr::opts_knit$get("root.dir")
+
+#set the project subfolders
+report_path <- paste0(project_path, "/reports/")              #report location
+data_input_path <- paste0(project_path, "/data_input/")       #data_in location
+data_modeling_path <- paste0(project_path, "/data_modeling/") #model_out location
+
+#vtreat_training_sample <- 0.40
+
+#*******************CALL LIBRARIES*****************************************
+suppressMessages({
+library(data.table)
+library(formatR)
+library(HiClimR)
+library(vtreat)
+library(WVPlots)
+library(lintr)
+library(caret)
+library(janitor)
+library(partykit)
+library(stringr)
+library(DataExplorer)
+library(smbinning)
+library(SmartEDA)
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+library(treeClust)
+library(fst)
+library(corrplot)
+library(dataCompareR)
+library(dplyr)
+library(fastDummies)
+library(doParallel)
+})
+#********************************INITIATE PARALLEL PROCESSING*******************
+detectCores()
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+#*******************************ASSIGN MODEL TYPE*******************************
+#"REG" = regression, "B_CLASS" = binary class, "M_CLASS" = multiclass
+analysis_type <- "REG"
+input_files <- 2
+project <- "Home Price"
+set.seed(123)
+
+#initialize modeling method for rpart
+if (analysis_type == "REG") {
+ eval_m <- "RMSE"
+ method_m <- "anova"
+ } else {
+ eval_m <- "class"
+  }
+
+```
+
+# MY FUNCTIONS {#sec-my-functions}
+
+```{r my-functions}
+#**************************Fast Frequency counts***************************
+# a little fast frequency count function
+fast_freq <- function(data, column_names) {
+  result <- lapply(column_names, function(column_name) {
+    data[, .N, by = column_name]
+  })
+  return(result)
+}
+#***************************Perform KS statistics*******************************
+# Function to perform KS test
+
+perform_ks_test <- function(col_name, dt1, dt2) {
+  ks_result <- ks.test(dt1[[col_name]],
+                       dt2[[col_name]])
+  return(ks_result)
+}
+
+#**************************char column to numeric var******************************
+# Define a function to convert a char column to ordered numeric values
+convert_to_ordered_numeric <- function(data, col_name, levels) {
+  data[, (paste0(col_name, "_ord")) := as.numeric(factor(get(col_name), levels = levels, ordered = TRUE))]
+}
+#******************************Read text file**************************************
+read_data <- function(filename) {
+  fread(filename,
+        sep = ",",  # Set separator as comma
+        nrows = -1, # Read all rows - use nrows = xxx to read partial file
+        check.names = TRUE,  # Check column names for validity
+        #n = 50000, #read random sample
+        header = TRUE,  # Set header as first row
+        #integer64 = 'numeric',# treat all integer columns as 64-bit integers
+        #quote = "'", #Use quote to specify character used to quote strings
+        na.strings = c("NA", "N/A", "null", "", "unknown"))
+ }
+
+#*****************************Sample data*****************************************
+create_sample <- function(data_in, sample_size) {
+
+    
+   data_in <- data_in[!is.na(data_in$target), ] #remove target rows with NA
+
+  if (nrow(data_in) > sample_size) {
+    data_sample <- data_in[sample(nrow(data_in), sample_size, replace = FALSE), ]
+  } else {
+    data_sample <- data_in
+  }
+  return(data_sample)
+}
+
+#*************************compare character columns values*************
+
+compare_unique_values <- function(file1, file2) {
+
+#get character columns
+common_cols <- intersect(names(file1)[sapply(file1, is.character)],
+                         names(file2)[sapply(file2, is.character)])  
+  
+  # Loop through common character columns
+  for (col in common_cols) {
+
+     # Extract unique values from each column
+    unique_file1 <- unique(file1[[col]])
+    unique_file2 <- unique(file2[[col]])
+
+    # Find common values
+    #common_values <- intersect(unique_train, unique_test)
+
+    # Find values unique to each table
+    unique_to_file1 <- setdiff(unique_file1, unique_file2)
+    unique_to_file2 <- setdiff(unique_file2, unique_file1)
+
+    # Print results for the current column
+    print(paste("Column:", col))
+
+    # Prioritize unique values in output
+    if (length(unique_to_file1) > 0) {
+      print(paste0("Unique to ", (substitute(file1)), ": ", unique_to_file1))
+    }
+    if (length(unique_to_file2) > 0) {
+      #print(paste0("Unique to test:", unique_to_test))
+      print(paste0("Unique to ", (substitute(file2)), ": ", ifelse(length(unique_to_file2) == 0, " 0", paste(unique_to_file2, collapse = " "))))
+    }
+
+    #print(paste0("Common values:", ifelse(length(common_values) == 0, " 0", paste(common_values, collapse = " "))))
+    cat("\n")
+  }
+}
+
+#************************compare data.table columns*************************
+  
+compare_column_names <- function(file1, file2) {
+
+#get character columns
+common_cols <- intersect(colnames(file1),colnames(file2))  
+
+  # Print the names of the data.tables passed to the function
+print(paste0("Comparing column names in ", (substitute(file1)), " and ", deparse(substitute(file2))))
+
+# Identify columns present in file2 but not in file1:
+cols_only_file1 <- setdiff(colnames(file1), colnames(file2))
+
+if (identical(colnames(file1), colnames(file2)) == TRUE) {
+  print(paste0("There are no column name differences between ", deparse(substitute(file1)), " and ", deparse(substitute(file2)), "'"))
+}
+else {
+# 2. Print a message indicating whether any unique columns exist in file2:
+print(paste0("Columns names unique to ", deparse(substitute(file1)), ": ",
+             ifelse(length(cols_only_file1) == 0, " 0",
+                    paste(cols_only_file1,
+                          collapse = " "))))
+
+# Columns only in file2
+
+# 3. Identify columns present in file1 but not in file2:
+cols_only_file2 <- setdiff(colnames(file2), colnames(file1))
+
+# 4. Print a message indicating whether any unique columns exist in file1:
+print(paste0("Columns names unique to ", deparse(substitute(file2)), ": ",
+             ifelse(length(cols_only_file2) == 0, " 0",
+                    paste(cols_only_file2,
+                          collapse = " "))))
+  }
+}
+# 5. Print a blank line for readability:
+cat("\n")
+
+#******************************Compare column classes************************
+# Define a function to compare the classes of two data.tables
+compare_column_classes <- function(dt1, dt2) {
+
+  # Get the names of the columns that are common to both data.tables
+common_cols <- intersect(colnames(dt1), colnames(dt2))
+  
+  # Print the names of the data.tables passed to the function
+print(paste0("Comparing column classes between ", deparse(substitute(dt1)), " and ", deparse(substitute(dt2))))
+
+if (identical(class(dt1), class(dt2)) == TRUE) {
+  print(paste0("There are no class differences between ", deparse(substitute(dt1)), " and ", deparse(substitute(dt2)), "'"))
+}
+else  {
+# Loop through the common columns and compare their classes
+for (col in common_cols) {
+  if (!identical(class(dt1[[col]]), class(dt2[[col]]))) {
+      print(paste0("Class for ", deparse(substitute(dt1)), " column ", col, " is ", class(dt1[[col]]), " and for ", deparse(substitute(dt2)), " it is ", class(dt2[[col]]), "'"))
+     }
+   }
+ }
+}
+
+
+#*********************************CHAID RPART ANALYSIS***********************
+
+call_rpart <- function(dt1, my_columns) {
+
+# Define the range of values for min_node_split for loop
+min_node_split_range <- seq(0.01 * nrow(dt1), 0.05 * nrow(dt1), length.out = 5)
+
+#initialize table to store model results
+results <- data.table(min_node_split = numeric(length(min_node_split_range)),
+                      numeric(length(min_node_split_range)))
+
+#assign 2nd coumn appropriate analysis metric
+setnames(results, 2, eval_m)
+
+#loop through the min_node_split_range
+for (i in seq_along(min_node_split_range)) {
+
+# Store min_node_split value in results table
+results$min_node_split[i] <- min_node_split_range[i]
+
+#initialize the rpart control
+my_control <- rpart.control(minsplit = min_node_split_range[i] * 3,
+                              minbucket = min_node_split_range[i], 
+                              xval = 5,
+                              surrogatestyle = 0)
+  # Create the partition using stratified sampling (optional)
+train_indices <- createDataPartition(dt1$target, p = 0.8, list = FALSE)
+
+#ceate model using fold indices
+rpart_model <- rpart(dt1$target[train_indices] ~ .,
+                     data = dt1[train_indices, ..my_columns],
+                     method = method_m,
+                     control = my_control)
+
+
+#create prediction using train data becaue factor levels have not been adjusted
+predictions <- predict(rpart_model, dt1[train_indices, ..my_columns])
+
+#collect metric in result table
+results[[eval_m]][i] <- get(eval_m)(dt1$target[train_indices], predictions)
+
+  }
+#}
+#***************************
+#Variable importance
+varimp_rpart_sig <- varImp(rpart_model, scale = TRUE)
+
+varimp_rpart_sig <- data.table(rownames(varimp_rpart_sig),
+                               varimp_rpart_sig["Overall"])
+
+setorder(varimp_rpart_sig, -Overall)
+
+varimp_rpart_sig <- varimp_rpart_sig[Overall > 0, ]
+#*****************************
+
+rpart_plot <- rpart.plot(rpart_model,
+                           type = 3,
+                           extra = 1,
+                           digits = 2,
+                           fallen.leaves = TRUE,
+                           roundint = TRUE,
+                           cex = NULL,
+                           tweak = 1.0,
+                           shadow.col = 'grey')
+#****************************
+
+#create list to be returned
+new_list <- list(results = results,
+                 varimp_rpart_sig = varimp_rpart_sig,
+                 rpart_plot = rpart_plot,
+                 rpart_model = rpart_model)
+
+return(new_list)
+}
+
+#***************************MISSING PERCENTAGES***************************
+
+
+missing_percentages <- function(dt1) {
+  
+cols_missing_perc <- round((colSums(is.na(dt1)) / nrow(dt1)) * 100, 2)[colSums(is.na(dt1)) > 0]
+
+missing_percentages <- sort(cols_missing_perc, decreasing = TRUE)
+
+return(missing_percentages)
+}
+```
+
+# [GET FILES:]{.underline} {#sec-get-files}
+
+## Read data {#sec-read-data}
+
+```{r read-dataa, message=TRUE, warning=TRUE}
+
+# Call function to read in data files
+if (input_files == 1) {
+  DT <- read_data(paste0(data_input_path, "DT.csv"))
+  saveRDS(DT, paste0(data_input_path, "DT.Rds"))
+} else if (input_files == 2) {
+  train <- read_data(paste0(data_input_path, "train.csv"))
+  train[, file := "train"]
+  saveRDS(train, paste0(data_input_path, "train.Rds"))
+  test <- read_data(paste0(data_input_path, "test.csv"))
+  test[, file := "test"]
+  saveRDS(test, paste0(data_input_path, "test.Rds"))
+}
+
+rm(read_data)
+
+#for speed testind a data dublication function
+#DT <- rbindlist(rep(list(DT), 1000))
+```
+
+## Compare train and test
+
+```{r message=TRUE, paged.print=TRUE}
+
+#compare column names
+compare_column_names(train, test)
+
+#**************************************************************************
+#compare column classes
+compare_column_classes(train,test)
+
+#**************************************************************************
+#compare values in character columns
+compare_unique_values(train, test)
+
+#************************************************************************
+ks_columns <- intersect(names(train)[sapply(train, is.numeric)],
+                        names(test)[sapply(test, is.numeric)])
+
+
+train_test_ks_test <- lapply(ks_columns, perform_ks_test, train, test)
+
+
+Report_ks_train_vs_test <- data.table(
+  Column = ks_columns,
+  KS_statistic = sapply(train_test_ks_test,
+                        function(result) result$statistic),
+                        p_value = sapply(train_test_ks_test,
+                                         function(result) round(result$p.value,
+                                          digits = 2)))
+
+saveRDS(Report_ks_train_vs_test, file = paste0(report_path,
+                                             file = "Report_ks_train_vs_test.rds"))
+
+rm(ks_columns, train_test_ks_test, Report_ks_train_vs_test)
+```
+
+## Stack train and test file {#sec-stack-train-and-test-file}
+
+```{r include=FALSE}
+  # stack train and test
+DT <- rbind(train, test, fill = TRUE, use.names = TRUE)
+
+rm(train, test)
+```
+
+## Join Files
+
+```{r eval=FALSE, include=FALSE}
+
+DT <-  merge(DT, people, by = "people_id", all.x = TRUE)
+DT$Id <- seq.int(nrow(DT))
+ 
+rm(people)
+```
+
+## Create record Id
+
+```{r}
+#create unique identifier for each row
+DT[, Id := as.integer(.I)]
+
+#move index to 1st column
+#setcolorder(DT, c("Id", colnames(DT)[1:(ncol(DT) - 1)]))
+
+setkey(DT$Id)
+
+```
+
+## Assign target name
+
+```{r}
+# assign target name
+setnames(DT, "SalePrice", "target")
+
+# move target to 1st column
+setcolorder(DT, c("target", setdiff(names(DT), "target")))
+
+```
+
+# [DATA SUMMARY REPORTS]{.underline}
+
+## Distribution Report
+
+```{r message=FALSE, include=FALSE, paged.print=FALSE}
+
+#create sample
+DT_sample_1 <- create_sample(DT, 50000)
+
+# Table with basic statistics
+Distribution_report <- smbinning.eda(DT_sample_1,
+                                     rounding = 2)
+
+Distribution_number <- Distribution_report$eda
+Distribution_percentages <- Distribution_report$edapct
+saveRDS(Distribution_report, file = paste0(report_path,
+                                               file = "Distribution_Report.rds"))
+
+rm(DT_sample_1)
+gc()
+```
+
+# [COLUMN WORK]{.underline} - cleaning
+
+## Column headers cleaning
+
+```{r eval=FALSE, include=FALSE}
+# identify non standard column headers
+# Define a regex pattern for non-standard column names
+
+non_standard_pattern <- "^[^A-Za-z_].*$"
+
+# Identify non-standard column names
+non_standard_cols <- names(DT)[grepl(non_standard_pattern, names(DT))]
+
+# Print the non-standard column names
+print(non_standard_cols)
+
+# Clean column names
+setnames(DT, clean_names(names(DT)))
+
+setnames(DT, old = c("a", "d"), new = c("anew", "dnew"))
+
+rm(non_standard_pattern, non_standard_cols)
+```
+
+## Columns class changes
+
+```{r include=FALSE}
+# If a column contains values that are strictly whole numbers (e.g., counts, IDs, years, months) make integer.
+
+#individual var
+#DT[, target := as.factor(target)]
+
+#by specific vars
+change_col_class <- c("MSSubClass", "MoSold")
+
+#by column text spring
+#change_col_class <- grep("(cat|bin)", names(DT), value = TRUE)
+
+#by all vars of a specific class
+#change_col_class <- colnames(DT[, .SD, .SDcols = sapply(DT, is.numeric)])
+
+#identify binaries to convert
+#change_col_class <- names(Filter(function(x)uniqueN(na.omit(x)) <= 2 & max(x) == 1, DT))
+
+#********************************************************************************#
+#do actual conversion
+DT[, (change_col_class) := lapply(.SD, as.character), .SDcols = change_col_class]
+#********************************************************************************#
+#*
+rm(change_col_class)
+```
+
+# TARGET PREP
+
+## Target Analysis & Prep
+
+```{r}
+#*****************target preparation****************************************
+# continuous target distribution
+if (analysis_type != "REG") {
+    DT[, .(.N), by = .(target)]
+    plot_bar(DT$target)
+} else {
+  print(summary(DT$target))
+  plot_histogram(DT$target)
+}
+
+# rename target value when binary
+if (analysis_type == 'B_CLASS') {
+  DT[, target := as.factor(target)]
+  # Switch levels 2 to 1 and 1 to 0
+  DT[, target_cat := factor(fifelse(target == "2", "1", "0"))]
+#DT[, target := ifelse(target == 1, "HaveNot", ifelse(target == 2, "Have", NA))]
+}
+
+# remove missing target records
+#DT[!is.na(target)]
+gc()
+```
+
+## Normalize Target Variable
+
+```{r eval=FALSE, include=FALSE}
+DT[, target := log(target + 1)]
+```
+
+# CREATE BYPASS TABLE {#sec-create-bypass-table}
+
+```{r include=FALSE}
+# identify vars for bypass table
+mov_var <- c("target", "Id")
+
+# create bypass table
+DT_bypass_file <- DT[, ..mov_var]
+
+# Store the bypass table to disk in compressed version
+write.fst(DT_bypass_file, paste0(data_modeling_path, "DT_bypass_file.fst"), 100)
+
+# Retrieve the data 
+# DT_report.Rds <- read.fst(paste0(data_path, "/DT_report.Rds"),
+#          columns = NULL,
+#          from = 1,
+#          to = NULL,
+#          as.data.table = FALSE,
+#          old_format = FALSE)
+
+# remove bypass table unless needed
+rm(mov_var, DT_bypass_file)
+gc()
+```
+
+# DATA EXPLORATION & REPORTING
+
+```{r}
+DT_sample_2 <- create_sample(DT, 50000)
+```
+
+## Data profile report
+
+```{r include=FALSE}
+# create in depth data report
+Data_profile_report <- create_report(DT_sample_2,
+                     y = "target",
+                    report_title = paste0(project, "Data Profile Report"),
+                    output_file = paste0(project, "_Data_Profile Report"),
+                    output_dir = report_path)
+```
+
+## Categorical variable report
+
+```{r}
+# analysis of categorical data
+Report_cat_vars <- ExpCatStat(DT_sample_2[, -c("Id")],
+                           Target = "target",
+                           result = "Stat",
+                           clim = 10,        #max cat levels allowed
+                           nlim = 10,        #max unique values for nums
+                           bins = 10,        #max number of bins
+                           plot = TRUE,
+                           Pclass= ifelse(analysis_type == "B_class",1, " "),                                 top = 20,
+                           Round = 2)
+
+print(Report_cat_vars)
+
+#save report to disk
+saveRDS(Report_cat_vars, file = paste0(report_path,
+                                       file = "Report_Categorical_vars.rds"))
+```
+
+## Categorical detail vars to target report
+
+```{r}
+# create 2 categories of target variable for report
+DT_sample_2[, target_cats := fifelse(is.na(target), NA_real_,  # Keep NAs as-is
+                         ifelse(target < 163000, 1,2))]
+
+
+
+# analysis of detailed categorical data
+Report_cat_detail_vars <- ExpCatStat(DT_sample_2[, -c("Id")],
+                          Target = "target_cats",
+                          result = "IV",
+                          clim = 5,          #max of cats allowed
+                          nlim = 10,         # of levels for num vars
+                          bins = 10,         #max bins for cat & num 
+                          Pclass = 1,
+                          plot = TRUE,
+                          top = 5,
+                          Round = 2)
+
+print(Report_cat_detail_vars)
+
+saveRDS(Report_cat_detail_vars,
+        file = paste0(report_path,
+                      file = "Report_categorical_detail_vars.rds"))
+
+#remove the categorized target variable
+DT_sample_2[, target_cats := NULL]
+```
+
+## Numeric vars to target report
+
+```{r paged.print=TRUE}
+Report_numerical_vars <- ExpNumStat(DT_sample_2[, -c("Id")],
+                               by = ifelse(analysis_type == "B_class", G, "A"),
+                                    gp = "target",
+                                    Qnt = NULL,
+                                    Nlim = 10,
+                                    MesofShape = 2,
+                                    Outlier = TRUE,
+                                    round = 2,
+                                    weight = NULL,
+                                    dcast = FALSE,
+                                    val = NULL)
+
+print(Report_numerical_vars)
+
+saveRDS(Report_numerical_vars, file = paste0(report_path,
+                                             file = "Report_numerical_vars.rds"))
+```
+
+# [DATA CLEANING]{.underline} {#sec-basic-data-cleaning}
+
+## Missing column value analysis
+
+```{r}
+# Calculate missing value percentage by column
+cols_missing_percentages <- missing_percentages(DT_sample_2)
+print(cols_missing_percentages)
+
+plot_missing(DT_sample_2, missing_only = TRUE)
+
+# Filter the vector based on the condition
+filtered_missing <- cols_missing_percentages[cols_missing_percentages > 80]
+
+rm_missing <- names(filtered_missing)
+
+if (length(filtered_missing) > 0) {
+  DT[, (rm_missing) := NULL]
+}
+
+rm(cols_missing_percentages, DT_sample_2)
+```
+
+## Missing row indicator
+
+```{r}
+
+par(ps = 8)
+#create column with count of NAs per row
+DT[, miss_row_count := rowSums(is.na(.SD))]
+
+# omit rows that have more than x missing values
+#DT[miss_row_count > X] <- NULL
+
+# see how many records are left
+#DT[complete.cases(DT[, ..omit_row]), ]
+```
+
+## Correct incorrect missing values
+
+```{r eval=FALSE, include=FALSE}
+{r eval=FALSE, include=FALSE}
+
+#Identify all columns with missing values
+cols_with_NA <- names(DT)[colSums(is.na(DT)) > 0]
+
+# replace some value in table like -1 with NA
+replace_value <- -1
+
+DT[, (cols_to_modify) := lapply(.SD, function(x) replace(x, x == replace_value, NA)), .SDcols = cols_to_modify]
+
+rm(cols_with_NA, replace_value)
+```
+
+## Columns {#sec-columns}
+
+### Unnecessary column removal {#sec-unnecessary-column-removal}
+
+```{r eval=FALSE, include=FALSE}
+#delete columns with one value
+rm_cols <- colnames(DT)[sapply(DT, function(x) length(unique(x))) == 1]
+
+#delete specific cols
+rm_cols <- c("age_orig", "housing_orig")
+
+if (length(rm_cols) > 0) {
+  DT[, c(rm_cols) := NULL]
+}
+
+rm(rm_cols)
+```
+
+### Encoding categorical data
+
+```{r eval=FALSE, include=FALSE}
+#get the var data, exlude NAs
+a <- DT[, unique(savings_balance_orig)] 
+
+
+# Encoding categorical data
+dataset$Country = factor(dataset$Country,
+                         levels = c('France', 'Spain', 'Germany'),
+                         labels = c(1, 2, 3))
+
+# Specify levels for each column
+checking_levels <- c("< 0 DM", "1 - 200 DM", "> 200 DM")
+savings_levels <- c("< 100 DM",  "101 - 500 DM", "501 - 1000 DM", "> 1000 DM")
+
+# Apply the function for each column
+convert_to_ordered_numeric(DT, "checking_balance_orig", checking_levels)
+convert_to_ordered_numeric(DT, "savings_balance_orig", savings_levels)
+
+rm(a, checking_levels, savings_levels)
+
+gc()
+```
+
+# [ANALYTICAL COLUMN REMOVAL]{.underline}
+
+## Remove high correlation vars
+
+```{r}
+DT_sample_2 <- create_sample(DT, 50000)
+
+# Get numeric column names, without missing value  & remove Id & target 
+num_cols <- setdiff(names(DT_sample_2)[sapply(DT_sample_2, 
+                    function(x) is.numeric(x) && !anyNA(x))],
+                    c("Id", 'target'))
+
+
+cor_matrix <- cor(DT_sample_2[, ..num_cols],
+                  use = "pairwise.complete.obs")
+
+#Create a data frame for flexible formatting and analysis
+correlation_df <- reshape2::melt(cor_matrix,
+                                 value.name = "Correlation")
+
+#filter the 
+filtered_correlation_df <- correlation_df[abs(correlation_df$Correlation) > 0.80 & abs(correlation_df$Correlation) < 1, ]
+
+filtered_correlation_df
+
+#find high correlation vars to delete
+high_corr_vars <- findCorrelation(cor_matrix, cutoff = 0.80, names = TRUE)
+print(high_corr_vars  )
+
+if (length(high_corr_vars) > 0) {
+  DT[, (high_corr_vars) := NULL]
+}
+
+ 
+rm(num_cols, cor_matrix, correlation_df, filtered_correlation_df, high_corr_vars)
+```
+
+## Remove near-zero-variance data
+
+```{r}
+nzv_cols <- nearZeroVar(
+  DT_sample_2[, -c('target', 'Id', 'file')], 
+  names = TRUE,
+  saveMetrics = TRUE,   #make TRUE to run report
+  freqCut = 95/5,
+  uniqueCut = 10,
+  allowParallel = TRUE)
+
+#make rownames into column
+rm_nzv_cols_dt <- data.table(rownames(nzv_cols), nzv_cols[c("freqRatio", "percentUnique", "zeroVar", "nzv")])
+
+setorder(rm_nzv_cols_dt, -freqRatio)
+
+print(rm_nzv_cols_dt[nzv == TRUE]) 
+
+rm_nzv_cols <- rm_nzv_cols_dt[nzv == TRUE, "V1"]
+rm_nzv_cols <- rm_nzv_cols$V1
+
+
+if (length(rm_nzv_cols) > 0) {
+  DT[, (rm_nzv_cols) := NULL]
+}
+
+# cleanup 
+rm(nzv_cols, rm_nzv_cols_dt, rm_nzv_cols)
+gc()
+```
+
+# VARIABLE IMPORTANCE ORIGINAL DATA
+
+## Continuous data correlation
+
+```{r}
+num_cols <- setdiff(colnames(DT_sample_2)[sapply(DT_sample_2, is.numeric)],
+                    c("Id", "file", "target"))
+
+# Calculate correlations efficiently using data.table
+correlation_to_target <- DT_sample_2[, cor(
+  .SD, target, 
+  use = "pairwise.complete.obs"),
+  .SDcols = num_cols] 
+
+# Create data.table using constructor
+correlation_to_target <- data.table(row_names = rownames(correlation_to_target),
+                         corr_coef = correlation_to_target[, 1])
+
+setorder(correlation_to_target, -corr_coef)
+
+print(correlation_to_target[1 - 20, ])
+
+rm(correlation_to_target, num_cols)
+```
+
+## Continuous data significance rpart
+
+```{r}
+
+num_cols <- setdiff(colnames(DT_sample_2)[sapply(DT_sample_2, is.numeric)],
+                    c("Id", "file"))
+
+rpart_results <- call_rpart(DT_sample_2, num_cols)
+
+print("Model Results")
+
+print(rpart_results$results)
+
+print("Variable Importance")
+
+print(rpart_results$varimp_rpart_sig)
+
+
+rm(num_cols, rpart_results)
+```
+
+## Categorical data significance rpart
+
+```{r}
+char_cols <- setdiff(colnames(DT_sample_2)[sapply(DT_sample_2, is.character)],
+                    c("Id", "file"))
+
+# Add "target" variable to char_cols
+char_cols <- c(char_cols, "target")
+
+rpart_results <- call_rpart(DT_sample_2, char_cols)
+
+print(rpart_results$results)
+
+print(rpart_results$varimp_rpart_sig)
+
+rm(char_cols, rpart_results)
+```
+
+## All data significance rpart
+
+```{r}
+all_cols <- setdiff(colnames(DT_sample_2), c("Id", "file"))
+
+
+rpart_results <- call_rpart(DT_sample_2, all_cols)
+
+print(rpart_results$results)
+
+print(rpart_results$varimp_rpart_sig)
+
+rm(rpart_results, all_cols)
+```
+
+# MISSING VALUES BEFORE TRANSORMATION
+
+```{r}
+# Calculate missing value percentage by column
+cols_missing_percentages <- missing_percentages(DT_sample_2)
+print(cols_missing_percentages)
+
+plot_missing(DT, missing_only = TRUE)
+
+rm(cols_missing_percentages)
+```
+
+# [CHARACTER & FACTOR ENCODING]{.underline} {#sec-character--factor-encoding}
+
+## Character-target encoding of nominal variables using vtreat
+
+### Three-way sampling - with designtreatment (vtreat)
+
+```{r eval=FALSE, include=FALSE}
+# Create indices for a training set (60%), validation set (20%), and test set (20%)
+calibration_indices <- createDataPartition(DT$target, p = 0.6, list = FALSE)
+remaining_data <- DT[-train_indices, ]
+
+validation_indices <- createDataPartition(remaining_data$target, p = 0.5, list = FALSE)
+test_indices <- setdiff(seq_len(nrow(remaining_data)), validation_indices)
+
+# use to create treatment plan
+DT_calibration_data <- DT[calibration_indices, ]
+DT_train_data <- remaining_data[validation_indices, ]
+DT_test_data <- remaining_data[test_indices, ]
+
+
+#remove target variable
+all_columns <- setdiff(colnames(DT_calibration_data), "target")
+# build the data treatments on calibration data
+
+DT_calib_treatment_plan = designTreatmentsC(DT_calibration_data,
+                                            all_columns,
+                                            outcomename = 'target',
+                                            outcometarget = '1',
+                                            verbose = FALSE,
+                                            missingness_imputation = NULL,
+                                            minFraction = 0.02,
+                                            parallelCluster = cl,
+                                            use_parallel = TRUE)
+
+DT_treatment_plan_detail <- setDT(DT_calib_treatment_plan$scoreFrame)
+
+DT_train_treated <- prepare(DT_calib_treatment_plan, DT_train_data, pruneSig = NULL)
+```
+
+### Two-way sampling with crossframetreatment (vtreat)
+
+```{r two-way-vtreat}
+
+# Create the training and test sets
+if (input_files == "1") {
+trainIndex <- createDataPartition(DT$target,
+                                  p = vtreat_training_sample,
+                                  list = FALSE)
+
+  DT_train_data <- DT[trainIndex, ]
+  DT_test_data  <- DT[-trainIndex, ]
+  rm(trainIndex)
+} else {
+  DT_train_data <- DT[!is.na(DT$target), ]
+  DT_test_data <- DT[is.na(DT$target), ]
+}  
+  
+#save DT
+write.fst(DT, paste0(data_modeling_path, "/DT.fst"), 100)
+#remove DT
+rm(DT)
+
+write.fst(DT_train_data, paste0(data_modeling_path, "/DT_train_data.fst"), 100)
+write.fst(DT_test_data, paste0(data_modeling_path, "/DT_test_data.fst"), 100)
+
+#******************************CREATE TREATMENT********************************
+if (analysis_type == "B_class") {
+#create binary treatment plan
+unpack[
+  DT_train_treatment_plan = treatments,               #treatmen plan
+  DT_train_treated = crossFrame                 #treated training data
+] <- mkCrossFrameCExperiment(
+  dframe = DT_train_data,
+  varlist = setdiff(colnames(DT_train_data), "target"),
+  outcomename = "target",
+  outcometarget = 1,
+  verbose = FALSE,
+  missingness_imputation = -111,
+  minFraction = 0.02,
+  parallelCluster = cl,
+  use_parallel = TRUE
+  )
+} else {
+  #create numeric treatment plan
+unpack[
+  DT_train_treatment_plan = treatments,
+  DT_train_treated = crossFrame
+  ] <- vtreat::mkCrossFrameNExperiment(
+    dframe = DT_train_data,      # data to learn transform from
+    varlist = setdiff(colnames(DT_train_data), "target"),
+    outcomename = 'target',   # outcome variable
+    missingness_imputation = -111
+    #parallelCluster =  cl
+    #use_parallel = TRUE
+  )
+}
+
+#save treatment plan
+saveRDS(DT_train_treatment_plan, paste0(report_path, "DT_train_treatment_plan.Rds"))
+
+#******************************GET TREATMENT PLAN*****************************
+#convert scoreFrame to data table
+DT_train_treatment_plan_detail <- setDT(DT_train_treatment_plan$scoreFrame)
+#save treatment detail
+saveRDS(DT_train_treatment_plan_detail,
+        paste0(report_path,
+               "DT_train_treatment_plan_detail.Rds"))
+
+#Recommendet variables
+recommended_vars <- DT_train_treatment_plan_detail[recommended == TRUE, varName]
+print(recommended_vars)
+
+#apply treatment to test data - don't convert to data.table
+DT_test_treated <- prepare(DT_train_treatment_plan, DT_test_data)
+
+#convert treated dataset to data.table
+setDT(DT_train_treated)
+setDT(DT_test_treated)
+
+#*******************************PREP TREATMENT FILE*************************
+#apply suffix "treat" to train and test data
+suffix <- "_treat"
+
+# Get column names to append suffix
+cols_to_update <- setdiff(colnames(DT_test_treated), c("target", "Id"))
+
+#apply suffix
+for (cnt in list(DT_test_treated, DT_train_treated)) {
+  setnames(cnt, old = cols_to_update, new = paste0(cols_to_update, suffix))
+}
+
+#assign replacement value used for missing values in treatment plan
+replace_value <- -111
+
+#get replacement columns
+cols_to_replaceNA <- colnames(DT_test_treated)
+
+DT_test_treated[, (cols_to_replaceNA) := lapply(.SD, function(x) replace(x, x == replace_value, NA)), .SDcols = cols_to_replaceNA]
+
+DT_train_treated[, (cols_to_replaceNA) := lapply(.SD, function(x) replace(x, x == replace_value, NA)), .SDcols = cols_to_replaceNA]
+
+
+rm( suffix, cols_to_update, recommended_vars, DT_test_data, DT_train_data, cnt, DT_train_treatment_plan_detail, DT_train_treatment_plan, replace_value, cols_to_replaceNA)
+gc()
+```
+
+#### Analysis between train and test data
+
+```{r eval=FALSE, warning=FALSE, include=FALSE}
+
+
+ks_columns <- setdiff(colnames(DT_train_treated), c("target", "Id"))
+
+# call function "perform_ks_test"
+ks_test_results <- lapply(ks_columns, perform_ks_test,
+                          DT_train_treated, DT_test_treated)
+
+# Combine results into a data.table
+Report_ks_results_treated <- data.table(
+  Column = ks_columns,
+  KS_statistic = sapply(ks_test_results,
+                        function(result) result$statistic),
+                        p_value = sapply(ks_test_results,
+                                         function(result) round(result$p.value,
+                                          digits = 2)))
+
+#save report to disk
+saveRDS(Report_ks_results_treated, file = paste0(report_path,
+                                           file = "Report_ks_results_treated.rds"))
+
+
+rm(ks_columns, p_value, file_name, replace_value, cols_to_modify, ks_test_results, Report_ks_results_treated)
+
+gc()
+```
+
+K[S STATISTICS SIGNIFICANTS LEVEL]{.underline}
+
+-   **0.00 to 0.20:** The two distributions are very similar.
+
+-   **0.20 to 0.40:** The two distributions are somewhat different.
+
+-   **0.40 to 0.60:** The two distributions are moderately different.
+
+-   **0.60 to 0.80:** The two distributions are substantially different.
+
+-   **0.80 to 1.00:** The two distributions are extremely different.
+
+# CHAID INTERACTION
+
+```{r}
+
+all_treat_cols <- setdiff(colnames(DT_train_treated), c("Id"))
+
+rpart_results <- call_rpart(DT_train_treated, all_treat_cols )
+
+print(rpart_results$results)
+
+print(rpart_results$varimp_rpart_sig)
+
+```
+
+## Create Interaction variables
+
+```{r}
+# Predict the nodes using the party model
+DT_train_treated[, node_rank := rpart.predict.leaves(rpart_results$rpart_model,
+                                                    newdata = DT_train_treated,
+                                                    type = 'where')]
+
+DT_train_treated <- fastDummies::dummy_columns(DT_train_treated, select_columns = "node_rank", remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+# apply scoring to DT_test_treated
+DT_test_treated[, node_rank := rpart.predict.leaves(rpart_results$rpart_model,
+                                                    newdata = DT_test_treated,
+                                                    type = 'where')]
+
+DT_test_treated <- fastDummies::dummy_columns(DT_test_treated, select_columns = "node_rank", remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+
+#save train_treated in binary file
+write.fst(DT_train_treated, paste0(data_modeling_path, "DT_train_treated.fst"), 100)
+
+#save test_treated in binary file
+write.fst(DT_test_treated, paste0(data_modeling_path, "DT_test_treated.fst"), 100)
+
+
+rm(rpart_model)
+gc()
+```
+
+# TREATMENT DATA REPORT
+
+```{r}
+Report_numerical_treatment_vars <- ExpNumStat(DT_train_treated[, -c("Id")],
+                               by = ifelse(analysis_type == "B_class", G, "A"),
+                                    gp = "target",
+                                    Qnt = NULL,
+                                    Nlim = 10,
+                                    MesofShape = 2,
+                                    Outlier = TRUE,
+                                    round = 2,
+                                    weight = NULL,
+                                    dcast = FALSE,
+                                    val = NULL)
+
+print(Report_numerical_vars)
+
+saveRDS(Report_numerical_treatment_vars,
+        file = paste0(report_path,
+                      file = "Report_numerical_treatment_vars.rds"))
+```
+
+# Missing treatment analysis
+
+```{r}
+# Calculate missing value percentage by column
+cols_missing_percentages <- missing_percentages(DT_train_treated)
+print(cols_missing_percentages)
+
+plot_missing(DT_train_treated, missing_only = TRUE)
+
+rm(cols_missing_percentages)
+```
+
+# [CLEAN-UP]{.underline}
+
+```{r}
+#remove global vars
+rm(cl, analysis_type, data_input_path, data_modeling_path, Data_profile_report, input_files, method_m, project, report_path, unpack, use.integer64, vtreat_training_sample, vtreat_treatment, project_path, eval_m)
+   
+#remove reports
+rm(Distribution_report, Report_cat_detail_vars, Report_cat_vars, Report_numerical_vars, Report_ks_results, Distribution_number, Distribution_percentages)
+
+#remove data
+rm(DT_test_treated, DT_train_treated)
+
+#remove functions
+rm(convert_to_ordered_numeric, create_sample, fast_freq, perform_ks_test, compare_column_classes, compare_column_names, compare_unique_values, call_rpart)
+
+#close cluster
+stopCluster(cl)
+```
+
+# [OTHER CODE]{.underline}
+
+Row level - binary pattern creation
+
+```{r eval=FALSE, include=FALSE}
+
+
+#identify binary variables
+create_bin_vars <- names(Filter(function(x) uniqueN(na.omit(x)) <= 2 & max(x) == 1, DT))
+
+#create variable that sums the values in Bin_vars 
+DT[, DT_sums  :=  rowSums(.SD, na.rm = TRUE), .SDcols = c(create_bin_vars)]
+
+#compute mean of values in Bin_vars 
+DT[, DT_means := rowMeans(.SD, na.rm = TRUE), .SDcols = c(create_bin_vars)]
+
+#concatenate binary variable across columns and make it a factor variable
+DT[, bin_pattern := do.call(paste0,.SD),.SDcols = create_bin_vars]
+DT[, bin_pattern := as.factor(bin_pattern)]
+
+# count zeros in row
+DT[, num_cols_eq_0 := Reduce(sum, lapply(.SD, function(x) na.omit(x) == 0))]
+
+#indicate if there are more than 4 missing values
+DT[, high_nas := ifelse(amount_nas > 4, 1,0)]
+
+rm(Bin_vars)
+```
+
+Row level aggregation by specific columns
+
+```{r eval=FALSE, include=FALSE}
+
+#conditionalby header identification aggregation 
+#product_up <- names(DT_tar)[which(regexpr("M_UP_1", names(DT_tar)) > 0)]
+#DT_tar[, prod_up := rowSums(.SD), by=ncodpers, .SDcols = product_up]  
+
+cols_title <-  c("reg", "car", "calc")
+#cols_title <- names(DT3)[which(regexpr(p, names(DT3)) > 0)]
+
+ for (p in cols_title) 
+  {
+    cols_title <- names(DT3)[which(regexpr(p, names(DT3)) > 0)]   
+    DT3[, paste0(p, '_sum')    := rowSums(.SD, na.rm = TRUE),
+        .SDcols = c(cols_title)] 
+    DT3[, paste0(p, '_mean')   := rowMeans(.SD, na.rm = TRUE),
+        .SDcols = c(cols_title)]
+    DT3[, paste0(p, '_ratio')  := ifelse(get(paste0(p, '_mean')) == 0,0,
+                                             (get(paste0(p, '_sum'))) / get(paste0(p, '_mean')))]
+  }
+```
+
+Casting to wide data when multiple ID exist - like customer id
+
+```{r eval=FALSE, include=FALSE}
+#create new summary table with sum, mean, count
+DT_summary_wide <- dcast(DT, customer_id ~ product_id + product_category,
+                         value.var = c("revenue_dollar", "return_dollar"), 
+                         fill = 0,
+                         fun.aggregate = list(sum, mean, length))
+
+#Create customer summary
+DT_customer_summary <- DT[, .(dol_revenue = sum(revenue_dollar),
+                              dol_returns = sum(return_dollar),
+                              cnt_purchases = length(product_id),
+                              cnt_prod_cats = .N,   
+                              cnt_returns = .N),
+                          by = .(customer_id)]
+
+# Combine customer and order summaries
+DT <- DT_summary_wide[DT_customer_summary, on = "Id"]
+
+```
+
+Column level
+
+```{r eval=FALSE, include=FALSE}
+#create new variable in DT
+DT[,`:=`(u = z + 1, v = z - 1)] 
+```
+
+LAT/LONG WORK
+
+```{r eval=FALSE, include=FALSE}
+library(geosphere)
+
+#Dist from centroid
+DT$longmean <- mean((DT$longitude), na.rm = TRUE) / 1e6
+DT$latmean  <- mean((DT$latitude), na.rm = TRUE) / 1e6
+
+#Adjusted long lat
+DT$longitude1 <- DT$longitude / 1e6
+DT$latitude1 <- DT$latitude / 1e6
+
+# Haversine distance
+ncol(DT)
+DT$geodist <- distHaversine(p[, 31:32], DT[, 33:34])
+
+rm_geo_cols <- c("longmean", "latmen", "longitude", "latitude1")
+
+DT <- DT[(rm_geo_cols) := NULL]
+```
+
+Identify and collapse high cardinality vars
+
+{r eval=FALSE, include=FALSE} library(Hmisc) #get non-numeric columns, exclude target & require \> 2 values char_fact_cols \<- colnames(DT)[!sapply(DT, function(x) { (is.numeric(x))}) & colnames(DT) != "target"]
+
+#test this #target_vector \<- DT\$target #lapply(DT_sample_2[, -c("Id")], table, target_vector)
+
+# frequency distribution before combining
+
+freq_before \<- lapply(char_fact_cols, function(col) { freq_dt \<- freq(DT_sample_2[, .(value = get(col))], plot = FALSE, na.rm = TRUE) freq_dt \<- cbind(freq_dt, column = col) return(freq_dt) })
+
+# creates table that shows freqs before transformation
+
+freq_before \<- rbindlist(freq_before)
+
+#each value in a var needs to have at least 5% coverage threshold = 0.05
+
+#combine levels if (length(char_fact_cols) \> 0) { DT[, (char_fact_cols) := lapply(.SD, function(x) combine.levels(x, minlev = threshold)), .SDcols = char_fact_cols] }
+
+# after combine frequency distributions
+
+freq_after \<- lapply(char_fact_cols, function(col) { freq_dt \<- freq(DT_sample_2[, .(value = get(col))], plot = FALSE, na.rm = TRUE) freq_dt \<- cbind(freq_dt, column = col) return(freq_dt) })
+
+# creates table with freqs after transformation
+
+freq_after \<- rbindlist(freq_after)
+
+rm(threshold, char_fact_cols, DT_sample_2) gc()
+
+```         
+
+Create binary variable from reduced cardinality
+
+{r eval=FALSE, include=FALSE}
+# get factor and char columns & exclude relevant columns
+conv_to_bins <- colnames(DT)[sapply(DT, function(x) {
+  (is.character(x) || is.factor(x)) && length(unique(x)) > 2
+}) & colnames(DT) != "target"]
+
+# length of the initial DT data 
+DT_cols <- ncol(DT) + 1
+
+if (length(conv_to_bins) > 0) {
+DT <- dummy_cols(
+  DT,
+  select_columns = conv_to_bins,
+  remove_first_dummy = TRUE,
+  remove_most_frequent_dummy = FALSE,
+  ignore_na = FALSE,
+  remove_selected_columns = FALSE,
+  split = NULL)}
+
+# Clean column names
+clean_names(DT)
+# Replace symbols with their corresponding abbreviations
+
+#replace < with LT
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "<", "LT"))
+
+#replace > with GT
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), ">", "GT"))
+
+#replace <= with LE
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "<=", "LE"))
+
+#replace => with GE
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "=>", "GE"))
+
+# Replace parentheses with an underscore
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "\\(|\\)", "_"))
+
+# Remove empty spaces from column names
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "\\s+", ""))
+
+#replace varies symbols with underscore
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "[&|/|,]", "_"))
+
+# Remove underscores at the end of column names
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "_$", ""))
+
+# define the suffix to name the bin columns
+suffix <- "_bin"
+
+# Get the bin column names to update
+cols_to_update <- colnames(DT)[DT_cols:length(DT)]
+
+# Append the suffix to the selected columns
+setnames(DT, old = cols_to_update, new = paste0(cols_to_update, suffix))
+
+# remove unnecessary orig_ identifier in the bin column
+setnames(DT, colnames(DT), str_replace_all(colnames(DT), "orig_", ""))
+
+#clean-up
+rm(conv_to_bins, DT_cols, cols_to_update, suffix)
+gc()
+```
+
+Create weighted binaries
+
+```{r eval=FALSE, include=FALSE}
+# List of binary columns
+weighted_bin_cols <- colnames(DT)[grep("_bin", colnames(DT))]
+
+# get DT row count
+DT_rows <- nrow(DT)
+
+
+for (col in weighted_bin_cols) {
+  new_col_name <- paste0(col, "_perc")
+  set(DT, j = new_col_name, value = ifelse(DT[[col]] == 1, sum(DT[[col]] == 1) / DT_rows, 0))
+}
+
+rm(weighted_bin_cols, DT_rows)
+gc()
+```
